@@ -1,0 +1,14 @@
+{
+  "client_key":      "YOUR_CLIENT_KEY",
+  "client_secret":   "YOUR_CLIENT_SECRET",
+  "redirect_uri":    "http://localhost:8080/callback",
+  "scopes":          "user.info.basic,user.info.profile,user.info.stats,video.list",
+  "poll_interval":   60,
+  "color_followers": [254, 44,  85],
+  "color_likes":     [105, 201, 208],
+  "color_views":     [100, 210, 130],
+  "views_enabled":   false,
+  "sound_likes":     "snd/1.wav",
+  "sound_followers": "snd/2.wav",
+  "sound_volume":    1.0
+}

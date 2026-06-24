@@ -3,10 +3,12 @@
 
 import hashlib
 import json
+import logging
 import os
 import random
 import string
 import struct
+import sys
 import tempfile
 import threading
 import time
@@ -27,6 +29,38 @@ import pystray
 _DIR           = os.path.dirname(os.path.abspath(__file__))
 _SETTINGS_FILE = os.path.join(_DIR, "settings.json")
 TOKEN_FILE     = os.path.join(_DIR, "token.json")
+_LOG_FILE      = os.path.join(_DIR, "tiktok_widget.log")
+
+logging.basicConfig(
+    filename=_LOG_FILE,
+    level=logging.WARNING,
+    format="%(asctime)s %(levelname)s %(message)s",
+    encoding="utf-8",
+)
+log = logging.getLogger("tiktok_widget")
+
+
+# ── Global crash logging ────────────────────────────────────────────────────────
+# Without these, an uncaught error in any thread silently kills the app. Now every
+# crash lands in tiktok_widget.log with a full traceback before the process dies.
+def _log_uncaught(exc_type, exc_value, exc_tb):
+    if issubclass(exc_type, KeyboardInterrupt):
+        sys.__excepthook__(exc_type, exc_value, exc_tb)
+        return
+    log.critical("UNCAUGHT EXCEPTION (main thread)",
+                 exc_info=(exc_type, exc_value, exc_tb))
+
+
+def _log_thread_uncaught(args):
+    if issubclass(args.exc_type, SystemExit):
+        return
+    name = args.thread.name if args.thread else "?"
+    log.critical("UNCAUGHT EXCEPTION (thread=%s)", name,
+                 exc_info=(args.exc_type, args.exc_value, args.exc_traceback))
+
+
+sys.excepthook        = _log_uncaught
+threading.excepthook  = _log_thread_uncaught
 
 _DEFAULTS: dict = {
     "client_key":       "",
@@ -390,13 +424,25 @@ class TikTokTray:
 
     # ── Polling ───────────────────────────────────────────────────────────────
     def _poll_loop(self):
-        if not self._tokens.is_valid():
-            if not (self._tokens.refresh_token and self._tokens.try_refresh()):
-                self._set_status("opening browser for auth...")
-                self._do_auth()
+        # Nothing in here may be allowed to kill the thread — a dead poll thread
+        # means the widget silently freezes (looks like a crash to the user).
+        # Every iteration is wrapped so any server response, missing response, or
+        # unexpected error just gets logged and we retry on the next interval.
+        try:
+            if not self._tokens.is_valid():
+                if not (self._tokens.refresh_token and self._tokens.try_refresh()):
+                    self._set_status("opening browser for auth...")
+                    self._do_auth()
+        except Exception:
+            log.exception("initial auth failed; will retry via refresh on next poll")
 
         while self._running:
-            self._fetch()
+            try:
+                self._fetch()
+            except Exception:
+                # _fetch already guards its own network calls, but this is the
+                # last line of defence so the loop can never die.
+                log.exception("poll iteration failed")
             for _ in range(POLL_INTERVAL):
                 if not self._running:
                     return
@@ -414,7 +460,9 @@ class TikTokTray:
         total    = 0
         cursor   = 0
         has_more = True
+        page     = 0
         while has_more:
+            page += 1
             r = requests.post(
                 "https://open.tiktokapis.com/v2/video/list/",
                 params={"fields": "id,view_count"},
@@ -425,12 +473,36 @@ class TikTokTray:
                 json={"max_count": 20, "cursor": cursor},
                 timeout=20,
             )
+            log.info("video/list page=%d cursor=%s -> HTTP %s", page, cursor, r.status_code)
+            if not r.ok:
+                # Surface the server's actual error body before raising.
+                log.error("video/list HTTP %s body: %s", r.status_code, r.text[:1000])
             r.raise_for_status()
-            data     = r.json().get("data", {})
-            for v in data.get("videos", []):
-                total += int(v.get("view_count", 0))
+
+            body     = r.json()
+            data     = body.get("data", {})
+            videos   = data.get("videos", [])
+            # The API also reports failures inside the body (error.code != "ok").
+            err      = body.get("error", {})
+            if err.get("code") not in (None, "ok"):
+                log.error("video/list error in body: %s", err)
+            if not videos:
+                log.warning("video/list page=%d returned 0 videos; raw data keys=%s",
+                            page, list(data.keys()))
+
+            page_total = 0
+            for v in videos:
+                if "view_count" not in v:
+                    log.warning("video %s has no view_count field; keys=%s",
+                                v.get("id"), list(v.keys()))
+                page_total += int(v.get("view_count", 0))
+            total += page_total
+            log.info("video/list page=%d: %d videos, page_views=%d, running_total=%d",
+                     page, len(videos), page_total, total)
+
             has_more = bool(data.get("has_more", False))
             cursor   = int(data.get("cursor", 0))
+        log.info("video/list finished: total_views=%d over %d page(s)", total, page)
         return total
 
     def _fetch(self):
@@ -454,8 +526,11 @@ class TikTokTray:
 
             self._followers = new_f
             self._likes     = new_l
+            log.info("user/info ok: followers=%d likes=%d views_enabled=%s",
+                     new_f, new_l, self._views_enabled)
 
         except Exception as exc:
+            log.exception("user/info fetch failed: %s", exc)
             self._set_status(f"error: {str(exc)[:60]}")
             return
 
@@ -463,28 +538,39 @@ class TikTokTray:
             try:
                 self._views = self._fetch_views()
             except requests.HTTPError as e:
+                status = e.response.status_code if e.response is not None else "?"
+                body   = e.response.text[:1000] if e.response is not None else ""
+                log.error("views fetch HTTPError %s: %s", status, body)
                 if self._tray_v:
                     self._tray_v.title = ("Views: re-auth needed (video.list scope missing)"
-                                          if e.response.status_code == 403
-                                          else f"Views error: {e.response.status_code}")
-            except Exception:
-                pass  # keep previous value
+                                          if status == 403
+                                          else f"Views error: {status}")
+            except Exception as exc:
+                log.exception("views fetch failed: %s", exc)
+                # keep previous value
 
-        self._set_icons(gained_f, gained_l)
+        # Rendering icons / playing sounds must never crash the caller either.
+        try:
+            self._set_icons(gained_f, gained_l)
 
-        vol = float(SETTINGS.get("sound_volume", 1.0))
-        if gained_f > 0 and not self._muted:
-            snd = str(SETTINGS.get("sound_followers", "snd/2.wav"))
-            threading.Thread(target=_play_sound, args=(snd, vol), daemon=True).start()
-        if gained_l > 0 and not self._muted_likes:
-            snd = str(SETTINGS.get("sound_likes", "snd/1.wav"))
-            threading.Thread(target=_play_sound, args=(snd, vol), daemon=True).start()
+            vol = float(SETTINGS.get("sound_volume", 1.0))
+            if gained_f > 0 and not self._muted:
+                snd = str(SETTINGS.get("sound_followers", "snd/2.wav"))
+                threading.Thread(target=_play_sound, args=(snd, vol), daemon=True).start()
+            if gained_l > 0 and not self._muted_likes:
+                snd = str(SETTINGS.get("sound_likes", "snd/1.wav"))
+                threading.Thread(target=_play_sound, args=(snd, vol), daemon=True).start()
 
-        if gained_f > 0 or gained_l > 0:
-            def _reset():
-                time.sleep(3)
-                self._set_icons()
-            threading.Thread(target=_reset, daemon=True).start()
+            if gained_f > 0 or gained_l > 0:
+                def _reset():
+                    time.sleep(3)
+                    try:
+                        self._set_icons()
+                    except Exception:
+                        log.exception("icon reset failed")
+                threading.Thread(target=_reset, daemon=True).start()
+        except Exception:
+            log.exception("updating icons/sounds failed")
 
     def _all_trays(self):
         return [t for t in (self._tray_f, self._tray_l, self._tray_v) if t]
@@ -502,6 +588,8 @@ class TikTokTray:
 
         def _run():
             win = tk.Tk()
+            win.report_callback_exception = lambda *a: log.error(
+                "Tk callback error", exc_info=a)
             win.overrideredirect(True)
             win.attributes("-topmost", True)
             win.configure(bg="#141414")
@@ -643,14 +731,19 @@ class TikTokTray:
 
         threading.Thread(target=self._poll_loop, daemon=True).start()
 
+        log.info("app started")
         self._tray_l.run_detached()
         self._tray_v.run_detached()
         try:
             self._tray_f.run()
+        except Exception:
+            log.exception("tray main loop crashed")
+            raise
         finally:
             self._running = False
             self._tray_l.stop()
             self._tray_v.stop()
+            log.info("app stopped (running=%s)", self._running)
 
 
 if __name__ == "__main__":

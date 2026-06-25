@@ -5,6 +5,7 @@ import hashlib
 import json
 import logging
 import os
+import queue
 import random
 import string
 import struct
@@ -349,7 +350,14 @@ class TikTokTray:
         self._tray_f: Optional[pystray.Icon] = None  # followers
         self._tray_l: Optional[pystray.Icon] = None  # likes
         self._tray_v: Optional[pystray.Icon] = None  # views
-        self._popup_win:  Optional[tk.Tk] = None
+
+        # All Tk objects live in ONE thread (the main thread). Worker threads must
+        # never touch Tk directly — they hand work to the UI thread through this
+        # queue, which the UI thread drains via root.after(). This is the single
+        # rule that prevents the C-level Tcl crashes that leave no Python log.
+        self._root:       Optional[tk.Tk]  = None
+        self._ui_q:       queue.Queue      = queue.Queue()
+        self._popup_win:  Optional[tk.Toplevel] = None
         self._popup_rows: dict             = {}
 
         self._COLOR_F = tuple(SETTINGS["color_followers"])
@@ -423,6 +431,23 @@ class TikTokTray:
             self._tray_f.title = text
 
     # ── Polling ───────────────────────────────────────────────────────────────
+    def _poll_supervisor(self):
+        # _poll_loop guards every iteration internally, so it should never die
+        # from a Python exception. This is the belt-and-braces layer: if the loop
+        # ever falls out (exception, or an unexpected return while still running),
+        # restart it after a short pause instead of leaving the widget frozen.
+        while self._running:
+            try:
+                self._poll_loop()
+            except Exception:
+                log.exception("poll loop crashed; restarting in 5s")
+            if not self._running:
+                break
+            for _ in range(5):
+                if not self._running:
+                    return
+                time.sleep(1)
+
     def _poll_loop(self):
         # Nothing in here may be allowed to kill the thread — a dead poll thread
         # means the widget silently freezes (looks like a crash to the user).
@@ -575,75 +600,101 @@ class TikTokTray:
     def _all_trays(self):
         return [t for t in (self._tray_f, self._tray_l, self._tray_v) if t]
 
+    # ── UI thread plumbing ────────────────────────────────────────────────────
+    def _post(self, fn):
+        # Hand a callable to the UI thread. Safe to call from ANY thread — the
+        # only thing that ever touches Tk is the UI thread draining this queue.
+        self._ui_q.put(fn)
+
+    def _pump_ui_queue(self):
+        try:
+            while True:
+                fn = self._ui_q.get_nowait()
+                try:
+                    fn()
+                except Exception:
+                    log.exception("ui task failed")
+        except queue.Empty:
+            pass
+        if self._root is not None and self._running:
+            try:
+                self._root.after(50, self._pump_ui_queue)
+            except Exception:
+                log.exception("ui pump reschedule failed")
+
     # ── Detail popup ──────────────────────────────────────────────────────────
     def _show_detail_popup(self):
+        # Menu callbacks fire on pystray's thread — never build Tk here directly.
+        self._post(self._toggle_popup)
+
+    def _toggle_popup(self):
+        # Runs on the UI thread only.
         if self._popup_win is not None:
             try:
-                self._popup_win.after(0, self._popup_win.destroy)
+                self._popup_win.destroy()
             except Exception:
                 pass
             self._popup_win  = None
             self._popup_rows = {}
             return
+        if self._root is None:
+            return
 
-        def _run():
-            win = tk.Tk()
-            win.report_callback_exception = lambda *a: log.error(
-                "Tk callback error", exc_info=a)
-            win.overrideredirect(True)
-            win.attributes("-topmost", True)
-            win.configure(bg="#141414")
+        win = tk.Toplevel(self._root)
+        win.report_callback_exception = lambda *a: log.error(
+            "Tk callback error", exc_info=a)
+        win.overrideredirect(True)
+        win.attributes("-topmost", True)
+        win.configure(bg="#141414")
 
-            border = tk.Frame(win, bg="#383838", padx=1, pady=1)
-            border.pack(fill="both", expand=True)
-            body = tk.Frame(border, bg="#141414")
-            body.pack(fill="both", expand=True)
+        border = tk.Frame(win, bg="#383838", padx=1, pady=1)
+        border.pack(fill="both", expand=True)
+        body = tk.Frame(border, bg="#141414")
+        body.pack(fill="both", expand=True)
 
-            def _rgb(c):
-                return "#{:02x}{:02x}{:02x}".format(*c)
+        def _rgb(c):
+            return "#{:02x}{:02x}{:02x}".format(*c)
 
-            row_defs = [
-                ("f", "Followers", self._followers,                               self._COLOR_F),
-                ("l", "Likes",     self._likes,                                   self._COLOR_L),
-                ("v", "Views",     self._views if self._views_enabled else None,  self._COLOR_V),
-            ]
-            popup_rows = {}
+        row_defs = [
+            ("f", "Followers", self._followers,                               self._COLOR_F),
+            ("l", "Likes",     self._likes,                                   self._COLOR_L),
+            ("v", "Views",     self._views if self._views_enabled else None,  self._COLOR_V),
+        ]
+        popup_rows = {}
 
-            for i, (key, label, value, color) in enumerate(row_defs):
-                row = tk.Frame(body, bg="#141414")
-                row.pack(fill="x")
-                tk.Frame(row, bg=_rgb(color), width=3).pack(side="left", fill="y")
-                inner = tk.Frame(row, bg="#141414")
-                inner.pack(side="left", fill="x", expand=True,
-                           padx=(10, 16),
-                           pady=(6 if i == 0 else 4, 6 if i == len(row_defs) - 1 else 4))
-                tk.Label(inner, text=label, fg="#5a5a5a", bg="#141414",
-                         font=("Segoe UI", 9), anchor="w").pack(side="left")
-                flip = _FlipValue(inner, _rgb(color))
-                flip.pack(side="right")
-                flip.set_value(f"{value:,}" if value is not None else "—", animate=False)
-                popup_rows[key] = flip
+        for i, (key, label, value, color) in enumerate(row_defs):
+            row = tk.Frame(body, bg="#141414")
+            row.pack(fill="x")
+            tk.Frame(row, bg=_rgb(color), width=3).pack(side="left", fill="y")
+            inner = tk.Frame(row, bg="#141414")
+            inner.pack(side="left", fill="x", expand=True,
+                       padx=(10, 16),
+                       pady=(6 if i == 0 else 4, 6 if i == len(row_defs) - 1 else 4))
+            tk.Label(inner, text=label, fg="#5a5a5a", bg="#141414",
+                     font=("Segoe UI", 9), anchor="w").pack(side="left")
+            flip = _FlipValue(inner, _rgb(color))
+            flip.pack(side="right")
+            flip.set_value(f"{value:,}" if value is not None else "—", animate=False)
+            popup_rows[key] = flip
 
-            win.update_idletasks()
-            w = max(win.winfo_reqwidth(), 240)
-            h = win.winfo_reqheight()
-            sw = win.winfo_screenwidth()
-            sh = win.winfo_screenheight()
-            win.geometry(f"{w}x{h}+{sw - w - 10}+{sh - h - 52}")
+        win.update_idletasks()
+        w = max(win.winfo_reqwidth(), 240)
+        h = win.winfo_reqheight()
+        sw = win.winfo_screenwidth()
+        sh = win.winfo_screenheight()
+        win.geometry(f"{w}x{h}+{sw - w - 10}+{sh - h - 52}")
 
-            win.bind("<Escape>", lambda e: win.destroy())
+        win.bind("<Escape>", lambda e: self._toggle_popup())
 
-            self._popup_win  = win
-            self._popup_rows = popup_rows
-            try:
-                win.mainloop()
-            finally:
-                self._popup_win  = None
-                self._popup_rows = {}
-
-        threading.Thread(target=_run, daemon=True).start()
+        self._popup_win  = win
+        self._popup_rows = popup_rows
 
     def _update_popup(self):
+        # Called from worker threads — just marshal the refresh to the UI thread.
+        self._post(self._apply_popup_values)
+
+    def _apply_popup_values(self):
+        # Runs on the UI thread only.
         win  = self._popup_win
         rows = self._popup_rows
         if not win or not rows:
@@ -658,9 +709,9 @@ class TikTokTray:
             flip = rows.get(key)
             if flip:
                 try:
-                    win.after(0, lambda f=flip, t=text: f.set_value(t))
+                    flip.set_value(text)
                 except Exception:
-                    pass
+                    log.exception("popup value update failed")
 
     # ── Tray entry point ──────────────────────────────────────────────────────
     def run(self):
@@ -691,6 +742,7 @@ class TikTokTray:
             self._running = False
             for t in self._all_trays():
                 t.stop()
+            self._post(lambda: self._root.quit() if self._root else None)
 
         menu = pystray.Menu(
             pystray.MenuItem(
@@ -729,20 +781,37 @@ class TikTokTray:
                                     self._make_icon("--", self._COLOR_V),
                                     "Views: disabled", menu)
 
-        threading.Thread(target=self._poll_loop, daemon=True).start()
+        threading.Thread(target=self._poll_supervisor, daemon=True,
+                         name="poll").start()
 
-        log.info("app started")
+        # Tray icons each run their own message loop in a background thread.
+        # The main thread is reserved entirely for Tk: one interpreter, one
+        # thread, no cross-thread Tcl calls — so the UI can never crash the
+        # process the way it silently did before.
+        self._tray_f.run_detached()
         self._tray_l.run_detached()
         self._tray_v.run_detached()
+
+        root = tk.Tk()
+        root.withdraw()
+        root.report_callback_exception = lambda *a: log.error(
+            "Tk callback error", exc_info=a)
+        self._root = root
+
+        log.info("app started")
+        self._pump_ui_queue()
         try:
-            self._tray_f.run()
+            root.mainloop()
         except Exception:
-            log.exception("tray main loop crashed")
+            log.exception("Tk main loop crashed")
             raise
         finally:
             self._running = False
-            self._tray_l.stop()
-            self._tray_v.stop()
+            for t in self._all_trays():
+                try:
+                    t.stop()
+                except Exception:
+                    pass
             log.info("app stopped (running=%s)", self._running)
 
 
